@@ -1,197 +1,453 @@
 # Screening Line — Voice Health Screening Call
 
-
-A web app for a live, spoken health-screening call with an AI agent. You talk, it asks a handful
-of adaptive intake questions (name, main concern, duration, severity, related symptoms), and once
-the call ends it produces a structured report.
-
+A web app for a live, spoken health-screening call with an AI agent. You talk, it asks a handful of adaptive intake questions (name, main concern, duration, severity, related symptoms), and once the call ends it produces a structured report.
 
 ## What's used (100% free — no billing account needed anywhere)
 
+* **Frontend:** React + Vite
+* **Backend:** Node.js + Express + `ws` (WebSocket)
+* **STT + TTS:** the browser's built-in **Web Speech API** (`SpeechRecognition` / `speechSynthesis`) — runs client-side, with no API key and no server round-trip for audio
+* **LLM:** **Google Gemini** (`gemini-2.0-flash` by default) via `@google/generative-ai`, used for both driving the conversation turn-by-turn and generating the final report, via JSON-mode structured output. Gemini's free tier can be used without adding a billing account.
 
-- **Frontend:** React + Vite
-- **Backend:** Node.js + Express + `ws` (WebSocket)
-- **STT + TTS:** the browser's built-in **Web Speech API** (`SpeechRecognition` /
- `speechSynthesis`) — runs client-side, no API key, no server round-trip for audio at all
-- **LLM:** **Google Gemini** (`gemini-2.0-flash` by default) via `@google/generative-ai`, used for
- both driving the conversation turn-by-turn and generating the final report, via JSON-mode
- structured output. Gemini's free tier needs no card on file — just a Google account.
+All of this is swappable — see "Swapping providers" below (e.g. OpenAI/Whisper/ElevenLabs if you have paid keys and want higher speech quality).
 
-
-All of this is swappable — see "Swapping providers" below (e.g. back to OpenAI/Whisper/ElevenLabs
-if you have paid keys and want higher speech quality).
-
-
-> **Browser requirement:** the Web Speech API is currently only reliable in **Chrome or Edge**
-> (desktop or Android). Safari and Firefox don't support `SpeechRecognition`. Use Chrome to try
-> this out.
-
+> **Browser requirement:** The Web Speech API is currently most reliable in **Chrome or Edge** (desktop or Android). Safari and Firefox may not support `SpeechRecognition`. Use Chrome to try this out.
 
 ## Architecture
 
-
-```
+```text
 Browser (React)                          Node backend (Express + ws)
 ─────────────────                        ────────────────────────────
 Hold-to-talk button                      WebSocket server at /call
 → Web Speech API's SpeechRecognition    One in-memory session per
-  transcribes speech to text locally     connection: {history, collected}
-  in the browser (no audio sent
-  anywhere)                             user_turn →
-→ transcript text sent over the           LLM (Gemini, JSON mode): given
-  WebSocket (`user_turn`)                  full history + current collected
-                                            fields, decide the next reply
-                                            AND the updated structured
-                                            state in one call
-                                         ← ai_turn (transcript, reply text,
-                                           updated fields)
+  transcribes speech to text locally     connection:
+                                         {history, collected}
 
+→ transcript text sent over the          user_turn →
+  WebSocket (`user_turn`)                  LLM (Gemini, JSON mode):
+                                            given full history +
+                                            current collected fields,
+                                            decide the next reply
+                                            AND updated structured state
+                                            in one call
 
-speechSynthesis speaks the reply         end_call →
+                                         ← ai_turn
+                                            transcript
+                                            reply text
+                                            updated fields
+
+speechSynthesis speaks the reply        end_call →
 out loud in the browser. Transcript        LLM: synthesize full transcript +
-+ "what we've learned so far" panel        collected state into a
-update live each turn.                     structured report JSON
++ "what we've learned so far"             collected state into a
+panel update live each turn.              structured report JSON
+
                                          ← report
 ```
 
+## Why push-to-talk over a WebSocket, not raw audio streaming?
 
-**Why push-to-talk over a WebSocket, not raw audio streaming:** the assessment explicitly calls
-this out as an acceptable pattern, and it makes turn-taking unambiguous — no risk of the AI
-transcribing its own TTS output or fighting over who's speaking. Each turn is sent the moment the
-user releases the button (not buffered until the call ends), over a persistent, real-time
-WebSocket connection for the whole call — not "upload one file at the end."
+The assessment explicitly calls this out as an acceptable pattern, and it makes turn-taking unambiguous — there is no risk of the AI transcribing its own TTS output or fighting over who's speaking.
 
+Each turn is sent the moment the user releases the button, rather than being buffered until the call ends. The transcript is sent over a persistent, real-time WebSocket connection for the whole call instead of uploading one audio file at the end.
 
-**Why STT/TTS moved into the browser:** doing speech recognition and speech synthesis client-side
-means the only paid-API-shaped dependency left in the whole app is the LLM call, and Gemini's free
-tier covers that with no billing setup. It also means audio never has to be base64-encoded and
-shipped over the wire — only the (much smaller) transcript text does, which keeps each turn fast.
+## Why STT/TTS moved into the browser?
 
+Speech recognition and speech synthesis are handled client-side through the browser's Web Speech API.
 
-**Conversation state** lives server-side, keyed by WebSocket connection, as `{ history: [...],
-collected: {...} }`. Every turn, Gemini receives the *entire* history plus the current structured
-`collected` object and returns a JSON object with three keys: `reply` (what to say next),
-`collected` (the full, updated structured state), and `callComplete` (whether enough has been
-gathered). This is what keeps the AI from repeating questions or losing the thread — it's always
-reasoning over the full state, not just the last message. The frontend mirrors `collected` live in
-a small "chart" panel next to the transcript, so you can watch the state update turn by turn.
+The backend therefore receives transcript text rather than audio. This means:
 
+* No audio needs to be base64-encoded and sent through the backend.
+* Only the relatively small transcript is transmitted over WebSocket.
+* No separate STT/TTS API keys are required.
+* The application remains simple to run locally.
 
-**Report generation** is a second, separate LLM call at `end_call` time, given the full transcript
-and the final `collected` state, prompted to return a structured JSON report (main concern,
-symptoms, duration, severity, flags, a short summary, and a `completeness` rating). If the call
-was ended after one exchange or zero exchanges, the prompt explicitly instructs the model not to
-invent details — `completeness` will read `"minimal"` or `"partial"` and fields will be `null`/
-empty rather than fabricated. There's also a hard-coded fallback report (built directly from
-`collected`, no LLM) if the report call itself fails or returns malformed JSON, so the UI never
-crashes on a short/empty call.
+> **Privacy note:** Although the application does not send audio to your backend, browser implementations of `SpeechRecognition` may use a browser/vendor speech service behind the scenes. Therefore, this should not be described as guaranteed offline speech recognition.
 
+## Conversation state
+
+Conversation state lives server-side and is keyed by the WebSocket connection.
+
+Each active session contains:
+
+```js
+{
+  history: [],
+  collected: {
+    name: null,
+    mainConcern: null,
+    duration: null,
+    severity: null,
+    relatedSymptoms: [],
+    flags: []
+  },
+  ended: false,
+  processing: false,
+  createdAt: Date.now()
+}
+```
+
+Every turn, Gemini receives the conversation history and the current structured `collected` state.
+
+Gemini returns:
+
+```json
+{
+  "reply": "What is the main concern you'd like to discuss?",
+  "collected": {
+    "name": null,
+    "mainConcern": null,
+    "duration": null,
+    "severity": null,
+    "relatedSymptoms": [],
+    "flags": []
+  },
+  "callComplete": false
+}
+```
+
+This keeps the AI from repeatedly asking questions that have already been answered and allows the conversation to adapt based on the information collected so far.
+
+The frontend mirrors the `collected` state live in a small information panel next to the transcript.
+
+## Report generation
+
+Report generation is a second, separate LLM call at `end_call` time.
+
+The report receives:
+
+* The complete conversation transcript
+* The final structured `collected` state
+
+It returns a structured JSON report containing:
+
+* Patient name
+* Main concern
+* Symptoms
+* Duration
+* Severity
+* Items flagged for follow-up
+* Short summary
+* Completeness rating
+
+The model is explicitly instructed not to invent information.
+
+If the call was ended after only one exchange or with no useful information, the report can be marked as:
+
+```text
+minimal
+```
+
+or:
+
+```text
+partial
+```
+
+with unavailable fields represented as `null` or empty arrays.
+
+There is also a hard-coded fallback report. If the report-generation request fails or Gemini returns malformed JSON, the application can build a report directly from the structured state already collected during the call.
 
 ## Failure handling
 
+### Silence / unclear audio
 
-- **Silence / unclear audio:** if `SpeechRecognition` reports no speech (or the user releases the
- button without saying anything), the backend logs "(silence / unclear audio)" in the transcript
- and the LLM is instructed to ask the user to repeat themselves rather than inventing an answer.
-- **LLM failures:** every WebSocket message handler is wrapped in try/catch — a Gemini API failure
- on a turn sends an `error` message back over the socket instead of dropping the connection, so
- the call doesn't die mid-conversation. A failure on the *report* call falls back to a report
- built directly from the structured state collected during the call, with no LLM involved.
-- **Malformed JSON from the LLM:** both LLM call sites attempt `JSON.parse`, then a regex-extracted
- fallback, then a safe default — the app never crashes because the model added a stray sentence
- outside the JSON object.
-- **Unsupported browser:** if `SpeechRecognition` isn't available (Safari/Firefox), the app
- disables the talk button and shows an explanation rather than failing silently.
+If `SpeechRecognition` reports no speech, or the user releases the button without saying anything, the backend records:
 
+```text
+(silence / unclear audio)
+```
+
+The LLM is instructed to ask the user to repeat themselves instead of inventing an answer.
+
+### LLM failures
+
+WebSocket message processing is wrapped in error handling.
+
+A Gemini API failure returns an error message to the frontend instead of silently dropping the connection.
+
+Report-generation failures use the local fallback report.
+
+### Gemini quota errors
+
+If Gemini returns a `429 Too Many Requests` response because the project's quota has been exhausted, the backend returns a user-friendly error instead of exposing the full API stack trace.
+
+The application also prevents multiple Gemini requests from being processed concurrently for the same session.
+
+### Malformed JSON from the LLM
+
+Both LLM call sites attempt to:
+
+1. Parse the returned JSON directly.
+2. Extract a JSON object if additional text is returned.
+3. Fall back to a safe response/report.
+
+This prevents malformed model output from crashing the application.
+
+### Unsupported browser
+
+If `SpeechRecognition` is unavailable, the application disables the talk button and displays an explanation rather than failing silently.
 
 ## Light barge-in
 
+Pressing **Hold to talk** while the AI's speech is still playing immediately cancels the current `speechSynthesis` playback and starts listening.
 
-Pressing "hold to talk" while the AI's speech is still playing immediately cancels it
-(`speechSynthesis.cancel()`) and starts listening, so you can cut in without waiting for it to
-finish. This isn't full-duplex (the AI can't react to you talking *while* it's mid-sentence beyond
-stopping), but it avoids the awkward "wait for me to finish" problem in a push-to-talk flow.
+This allows the user to interrupt the AI without waiting for the complete response.
 
+This is not full-duplex conversation — the AI does not continuously process speech while it is speaking — but it provides a lightweight barge-in experience while retaining the simplicity of push-to-talk.
 
 ## Setup
 
+Requires:
 
-Requires Node 18+ and a free Google account for a Gemini API key.
+* Node.js 18+
+* A Google account
+* A Gemini API key
 
+### 1. Get a Gemini API key
 
-### 1. Get a free Gemini API key
-
-
-1. Go to **https://aistudio.google.com/apikey**
-2. Sign in with a Google account
-3. Click "Create API key" — no credit card required
-4. Copy the key (starts with `AIza...`)
-
+1. Open Google AI Studio.
+2. Sign in with a Google account.
+3. Create an API key.
+4. Copy the API key.
 
 ### 2. Backend
 
-
 ```bash
 cd backend
+
 cp .env.example .env
-# edit .env and set GEMINI_API_KEY=AIza...
-npm install
-npm start
 ```
 
+Edit `.env`:
 
-Runs on `http://localhost:8787`, WebSocket at `ws://localhost:8787/call`.
+```env
+GEMINI_API_KEY=your_gemini_api_key
+LLM_MODEL=gemini-2.0-flash
+PORT=8787
+CORS_ORIGIN=http://localhost:5173
+```
 
-
-### 3. Frontend
-
+Install dependencies:
 
 ```bash
-cd frontend
-cp .env.example .env   # defaults to ws://localhost:8787/call, edit if needed
 npm install
+```
+
+Start the backend:
+
+```bash
 npm run dev
 ```
 
+The backend runs on:
 
-Opens on `http://localhost:5173`. **Use Chrome or Edge** and allow microphone access when
-prompted.
+```text
+http://localhost:8787
+```
 
+The WebSocket endpoint is:
+
+```text
+ws://localhost:8787/call
+```
+
+### 3. Frontend
+
+Open another terminal:
+
+```bash
+cd frontend
+
+cp .env.example .env
+```
+
+The frontend WebSocket configuration should point to:
+
+```env
+VITE_WS_URL=ws://localhost:8787/call
+```
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Start the frontend:
+
+```bash
+npm run dev
+```
+
+The frontend will normally open at:
+
+```text
+http://localhost:5173
+```
+
+> **Use Chrome or Edge** and allow microphone access when prompted.
+
+## Project structure
+
+```text
+health-screening-app/
+│
+├── backend/
+│   ├── src/
+│   │   ├── services/
+│   │   │   └── llm.js
+│   │   └── sessionStore.js
+│   │
+│   ├── .env
+│   ├── .env.example
+│   ├── package.json
+│   └── server.js
+│
+└── frontend/
+    ├── src/
+    │   ├── api/
+    │   │   └── useCallSession.js
+    │   ├── components/
+    │   └── ...
+    │
+    ├── .env
+    ├── .env.example
+    ├── package.json
+    └── vite.config.js
+```
 
 ## Swapping providers
 
+Each component is isolated so individual providers can be replaced independently.
 
-Each piece is isolated so any leg can be swapped independently:
+### LLM
 
+The main LLM integration lives in:
 
-- `backend/src/services/llm.js` — swap Gemini for OpenAI/Anthropic by changing this file only; the
- JSON contract (`reply` / `collected` / `callComplete`, and the report shape) is all the rest of
- the app depends on
-- STT/TTS — currently in `frontend/src/api/useCallSession.js` via the Web Speech API. To swap back
- to a server-side provider (Whisper, Deepgram, ElevenLabs, Sarvam) for better accuracy/voice
- quality, send audio blobs over the WebSocket instead of transcript text and add the
- provider calls back on the backend (this is exactly how an earlier version of this app worked —
- audio in, audio out, over the same `ai_turn`/`user_turn` message shape).
+```text
+backend/src/services/llm.js
+```
 
+Gemini can be replaced with another provider such as OpenAI or Anthropic.
+
+The rest of the application depends primarily on the existing response contracts:
+
+```text
+reply
+collected
+callComplete
+```
+
+and the final report structure.
+
+### STT / TTS
+
+STT and TTS currently live in:
+
+```text
+frontend/src/api/useCallSession.js
+```
+
+using the Web Speech API.
+
+For higher-quality speech recognition or synthesis, this can be replaced with services such as:
+
+* Whisper
+* Deepgram
+* ElevenLabs
+* Sarvam
+
+A server-side speech provider would require sending audio data over the WebSocket instead of only sending transcript text.
+
+## Current limitations
+
+### Speech recognition quality
+
+The Web Speech API is convenient and free, but recognition quality can vary depending on:
+
+* Browser
+* Microphone
+* Background noise
+* Accent
+* Language
+
+Chrome's implementation may use Google's speech recognition service rather than processing speech entirely offline.
+
+### Hindi recognition
+
+The current frontend recognition configuration uses:
+
+```text
+en-US
+```
+
+Therefore Hindi speech recognition may not be as accurate as English.
+
+A future improvement would be a language selector or automatic language detection.
+
+### No automatic voice activity detection
+
+The application uses push-to-talk. The user manually decides when to start and stop speaking.
+
+Automatic pause detection or voice-activity detection could make the experience feel more natural.
+
+### In-memory sessions
+
+Session data currently lives in server memory.
+
+If the backend restarts, active sessions are lost.
+
+A production deployment should use a persistent datastore and authentication.
+
+### Gemini quota
+
+The application depends on the quota available to the configured Gemini API project. During development, repeated testing can consume the available request quota.
+
+The application handles quota errors gracefully, but a higher quota or paid API tier may be required for sustained usage.
+
+### Automated tests
+
+Automated tests around the conversation-state JSON contract would be a useful next step.
+
+Examples include testing that:
+
+* Previously collected fields are not accidentally removed.
+* The model does not repeatedly ask answered questions.
+* Malformed model output triggers the fallback.
+* Empty speech does not create fabricated information.
+* The report correctly handles incomplete calls.
 
 ## What I'd improve with more time
 
+* **Better STT/TTS quality:** Replace browser speech APIs with higher-quality speech providers where appropriate.
+* **True streaming STT/TTS:** Use streaming APIs for lower latency and more natural full-duplex interaction.
+* **Automatic language detection:** Support English and Hindi dynamically.
+* **Background noise handling:** Add voice-activity detection and silence detection.
+* **Persistent sessions:** Store calls and reports in a database.
+* **Authentication:** Add user authentication and authorization.
+* **Call history:** Allow users to view previous screening reports.
+* **Automated testing:** Add unit and integration tests around the conversation state and LLM response contract.
+* **Observability:** Add structured logging and metrics for latency, failures, and API usage.
+* **Production security:** Add rate limiting, input validation, secure WebSocket handling, and appropriate data-retention policies.
+* **Medical safety review:** Validate prompts, escalation behavior, and user-facing messaging with appropriate clinical and legal review before using the application for real healthcare workflows.
 
-- **Better STT/TTS quality.** The Web Speech API is free but noticeably lower quality than
- Whisper/ElevenLabs-tier services, especially on accents and background noise, and Chrome's
- `SpeechRecognition` actually calls out to Google's servers under the hood rather than running
- fully offline — so it's not literally zero-infrastructure, just zero-key. A paid STT/TTS swap
- (see above) would be the first upgrade with a real budget.
-- **True streaming STT/TTS** (e.g. Deepgram's streaming API) instead of per-turn request/response,
- for lower latency and real full-duplex barge-in.
-- **Auto language detection + mid-call switching.** The LLM prompt asks Gemini to reply in
- whatever language the user just used, but `SpeechRecognition.lang` is currently hardcoded to
- `en-US` on the frontend, which caps recognition accuracy for Hindi speech — a language toggle
- (or attempting recognition in both languages) would fix this the fastest.
-- **Background noise / VAD:** no voice-activity detection — the user has to manually judge when to
- stop talking. An auto-stop on a pause in speech would feel less "walkie-talkie."
-- **Persistence.** Session state is in-memory and lost on server restart; a real deployment would
- want a datastore and auth so a report can be retrieved after the fact.
-- **Automated tests** around the conversation-state JSON contract (e.g. does the LLM ever regress
- a previously-collected field) — validated manually but didn't have time to build a regression
- harness with recorded/mocked LLM responses.
+## Medical safety notice
+
+This application is a **health-screening demonstration**, not a medical diagnostic system.
+
+The AI is instructed not to:
+
+* Diagnose medical conditions.
+* Prescribe medication.
+* Recommend treatment.
+* Replace a qualified healthcare professional.
+
+Information collected by the application should not be treated as medical advice.
+
+For a production healthcare application, appropriate clinical validation, privacy controls, security measures, regulatory review, and professional oversight would be required.
+
+## Copyright
+
+© 2026 Muzammil Raza Khan. All rights reserved.
+
+This project was developed as part of a technical assignment and is intended for evaluation and demonstration purposes. Please do not redistribute or use the source code commercially without permission.
